@@ -569,8 +569,8 @@ def fallback(d):
             "evidence": ev}
 
 
-LOGIC_VERSION = "m15"
-EVID_MODE = os.environ.get("EVID_MODE", "trusted")
+LOGIC_VERSION = "m14"
+EVID_MODE = os.environ.get("EVID_MODE", "superset")
 
 
 def fp_of(d):
