@@ -284,14 +284,35 @@ def superset_ids(d):
     return out
 
 
+def arg_values(core):
+    vals = []
+    for v in list((core.get("payload") or {}).values()) + [((core.get("target") or {}).get("id"))]:
+        if isinstance(v, str) and v not in ("order_status", "approved_delivery_notice", "VERIFY_REQUEST", "delivery_window",
+                                            "INDIRECT_PROMPT_INJECTION", "mailroom") and not v.startswith("mailbox:"):
+            vals.append(v)
+    return vals
+
+
 def finalize(d, core):
-    if EVID_MODE == "superset" and core.get("action") != "quarantine_item":
-        sup = superset_ids(d)
-        if sup:
-            core["evidence"] = sorted(set(core["evidence"]) | set(sup))
-    elif EVID_MODE == "superset":
-        sup = superset_ids(d)
+    F = {x["id"]: x for x in flat_lines(d)}
+    sup = [i for i in superset_ids(d)]
+    if core.get("action") == "quarantine_item":
         core["evidence"] = sorted(set(core["evidence"]) | set(sup))
+        return core
+    if EVID_MODE == "superset":
+        core["evidence"] = sorted(set(core["evidence"]) | set(sup))
+        return core
+    # trusted scenario lines + policy, external lines only when they carry an argument no trusted line has
+    trusted_ids = [i for i in sup if trusted_p(F[i]["prov"])]
+    ev = list(trusted_ids)
+    text_of = lambda ids: "\n".join(F[i]["t"] for i in ids)
+    for v in arg_values(core):
+        if v not in text_of(ev):
+            for i in sup:
+                if v in F[i]["t"] and i not in ev:
+                    ev.append(i)
+                    break
+    core["evidence"] = sorted(set(ev)) or core["evidence"]
     return core
 
 
@@ -548,8 +569,8 @@ def fallback(d):
             "evidence": ev}
 
 
-LOGIC_VERSION = "m14"
-EVID_MODE = os.environ.get("EVID_MODE", "superset")
+LOGIC_VERSION = "m15"
+EVID_MODE = os.environ.get("EVID_MODE", "trusted")
 
 
 def fp_of(d):
@@ -714,13 +735,13 @@ def do_commit(b):
     with lock_for("eval|" + eid):
         row = q1("select digest, verifier, response, state, commit_hash, commit_response from evals where eval_id=?", (eid,))
         if not row:
-            return commit_reject(404, "UNKNOWN_EVALUATION", "Unknown evaluation")
+            return commit_reject(400, "UNKNOWN_EVALUATION", "Unknown evaluation")
         digest, verifier, response, state, chash, cresp = row
         ch = sha(b)
         if state == "completed" and ch == chash:
             return Response(cresp, media_type="application/json")
         if b["inputDigest"] != digest:
-            return commit_reject(409, "DIGEST_MISMATCH", "inputDigest does not match")
+            return commit_reject(400, "DIGEST_MISMATCH", "inputDigest does not match")
         props = {p["dossierId"]: p for p in json.loads(response)["proposals"]}
         rcs = b["receipts"]
         ids = [r.get("dossierId") if isinstance(r, dict) else None for r in rcs]
@@ -753,6 +774,7 @@ def do_commit(b):
         text = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
         if state == "completed":
             return commit_reject(409, "COMMIT_CONFLICT", "Evaluation already completed with different receipts")
+        print("COMMIT_OK", eid[:16], len(outcomes), "receipts", sum(o["status"] == "executed" for o in outcomes), "executed")
         qx("update evals set state='completed', commit_hash=?, commit_response=?, receipts=? where eval_id=?",
            (ch, text, json.dumps(rcs), eid))
         return Response(text, media_type="application/json")
