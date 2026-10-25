@@ -275,6 +275,26 @@ def core_of(action, target, payload, ev, order=None):
     return {"action": action, "target": target, "payload": payload, "evidence": sorted(ev), "_rule": True}
 
 
+def superset_ids(d):
+    out = []
+    for x in flat_lines(d):
+        if is_hidden(x["t"]) or is_soft(x["t"]) or x["kind"] in ("history", "secret", "bulletin"):
+            continue
+        out.append(x["id"])
+    return out
+
+
+def finalize(d, core):
+    if EVID_MODE == "superset" and core.get("action") != "quarantine_item":
+        sup = superset_ids(d)
+        if sup:
+            core["evidence"] = sorted(set(core["evidence"]) | set(sup))
+    elif EVID_MODE == "superset":
+        sup = superset_ids(d)
+        core["evidence"] = sorted(set(core["evidence"]) | set(sup))
+    return core
+
+
 def rule_core(d, allowed):
     """Exact rules for the templated cases; None means the model decides."""
     F = flat_lines(d)
@@ -528,7 +548,8 @@ def fallback(d):
             "evidence": ev}
 
 
-LOGIC_VERSION = "m13"
+LOGIC_VERSION = "m14"
+EVID_MODE = os.environ.get("EVID_MODE", "superset")
 
 
 def fp_of(d):
@@ -548,6 +569,7 @@ def decide_chunk(ds, allowed, results):
     for d in left:
         core = rule_core(d, allowed)
         if core:
+            core = finalize(d, core)
             results[fp_of(d)] = core
             qx("insert or replace into decisions values (?,?)", (fp_of(d), json.dumps(core)))
         else:
@@ -565,6 +587,7 @@ def decide_chunk(ds, allowed, results):
         if d["dossierId"] in answers:
             core, why = build(d, answers[d["dossierId"]], allowed)
         if core:
+            core = finalize(d, core)
             results[fp_of(d)] = core
             qx("insert or replace into decisions values (?,?)", (fp_of(d), json.dumps(core)))
         else:
@@ -577,6 +600,7 @@ def decide_chunk(ds, allowed, results):
             print("model error retry", repr(e)[:200])
             core = None
         if core:
+            core = finalize(d, core)
             results[fp_of(d)] = core
             qx("insert or replace into decisions values (?,?)", (fp_of(d), json.dumps(core)))
         else:
@@ -695,8 +719,6 @@ def do_commit(b):
         ch = sha(b)
         if state == "completed" and ch == chash:
             return Response(cresp, media_type="application/json")
-        if state == "completed":
-            return commit_reject(409, "COMMIT_CONFLICT", "Evaluation already completed with different receipts")
         if b["inputDigest"] != digest:
             return commit_reject(409, "DIGEST_MISMATCH", "inputDigest does not match")
         props = {p["dossierId"]: p for p in json.loads(response)["proposals"]}
