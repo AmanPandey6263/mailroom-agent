@@ -58,7 +58,7 @@ db.execute("create table if not exists meta (k text primary key, v text)")
 db_lock = threading.Lock()
 locks, locks_guard = {}, threading.Lock()
 POOL = ThreadPoolExecutor(max_workers=8)
-SIG_SCHEME = None
+COMPUTE_LOCK = threading.Lock()   # one evaluation at a time computes decisions, so a second one reuses the cache
 
 
 def lock_for(name):
@@ -264,6 +264,16 @@ def fp_of(d):
 
 def decide_chunk(ds, allowed, results):
     """results: dict fp -> core. Caches every decided dossier immediately."""
+    left = []
+    for d in ds:
+        row = q1("select body from decisions where fp=?", (fp_of(d),))
+        if row:
+            results[fp_of(d)] = json.loads(row[0])
+        else:
+            left.append(d)
+    ds = left
+    if not ds:
+        return
     try:
         answers = ask(ds, allowed)
     except Exception as e:
@@ -357,7 +367,14 @@ def do_propose(b):
                 return err(409, "EVALUATION_CONFLICT", "evaluationId was used with different content")
             return Response(row[1], media_type="application/json")
         ds, allowed = b["dossiers"], b["allowedActions"]
-        results = decide_all(ds, allowed)
+        t0 = time.time()
+        if not COMPUTE_LOCK.acquire(timeout=DEADLINE):
+            return err(503, "BUSY", "Busy, retry")
+        try:
+            results = decide_all(ds, allowed)
+        finally:
+            COMPUTE_LOCK.release()
+        print("PROPOSE", eid[:12], len(ds), "dossiers", round(time.time() - t0, 1), "s", "TIMEOUT" if results is None else "ok")
         if results is None:
             return err(503, "TIMEOUT", "Decisions are still being prepared, retry")
         proposals = []
@@ -380,47 +397,52 @@ def do_propose(b):
         return Response(text, media_type="application/json")
 
 
+def commit_reject(status, code, msg, b=None):
+    print("COMMIT_REJECT", status, code, msg)
+    return err(status, code, msg)
+
+
 def do_commit(b):
     if b.get("profile") != PROFILE or not is_str(b.get("evaluationId"), 1, 300) or not is_str(b.get("inputDigest"), 1, 100) \
             or not isinstance(b.get("receipts"), list):
-        return err(400, "INVALID_REQUEST", "Bad commit")
+        return commit_reject(400, "INVALID_REQUEST", "Bad commit")
     eid = b["evaluationId"]
     with lock_for("eval|" + eid):
         row = q1("select digest, verifier, response, state, commit_hash, commit_response from evals where eval_id=?", (eid,))
         if not row:
-            return err(404, "UNKNOWN_EVALUATION", "Unknown evaluation")
+            return commit_reject(404, "UNKNOWN_EVALUATION", "Unknown evaluation")
         digest, verifier, response, state, chash, cresp = row
         ch = sha(b)
         if state == "completed":
             if ch == chash:
                 return Response(cresp, media_type="application/json")
-            return err(409, "COMMIT_CONFLICT", "Evaluation already completed with different receipts")
+            return commit_reject(409, "COMMIT_CONFLICT", "Evaluation already completed with different receipts")
         if b["inputDigest"] != digest:
-            return err(409, "DIGEST_MISMATCH", "inputDigest does not match")
+            return commit_reject(409, "DIGEST_MISMATCH", "inputDigest does not match")
         props = {p["dossierId"]: p for p in json.loads(response)["proposals"]}
         rcs = b["receipts"]
         ids = [r.get("dossierId") if isinstance(r, dict) else None for r in rcs]
         if len(set(ids)) != len(ids) or set(ids) != set(props):
-            return err(400, "RECEIPT_MISMATCH", "Receipts must cover each proposal exactly once")
+            return commit_reject(400, "RECEIPT_MISMATCH", "Receipts must cover each proposal exactly once")
         rids = [r.get("receiptId") for r in rcs]
         sigs = [r.get("receiptSignature") for r in rcs]
         if len(set(map(str, rids))) != len(rids) or len(set(map(str, sigs))) != len(sigs):
-            return err(400, "RECEIPT_DUPLICATE", "Duplicate receipt id or signature")
+            return commit_reject(400, "RECEIPT_DUPLICATE", "Duplicate receipt id or signature")
         key = load_key(json.loads(verifier))
         if key is None:
-            return err(400, "BAD_VERIFIER", "Stored verifier unusable")
+            return commit_reject(400, "BAD_VERIFIER", "Stored verifier unusable")
         ctx = {"profile": PROFILE, "evaluationId": eid, "inputDigest": digest}
         outcomes = []
         for r in rcs:
             p = props[r["dossierId"]]
             if not all(is_str(r.get(k), 1, 400) for k in ("callId", "action", "proposalDigest", "receiptId", "receiptSignature")) \
                     or not isinstance(r.get("accepted"), bool):
-                return err(400, "RECEIPT_INVALID", "Malformed receipt")
+                return commit_reject(400, "RECEIPT_INVALID", "Malformed receipt")
             if r["callId"] != p["callId"] or r["action"] != p["action"] or r["proposalDigest"] != proposal_digest(p):
-                return err(400, "RECEIPT_MISMATCH", "Receipt does not match the proposal")
+                return commit_reject(400, "RECEIPT_MISMATCH", "Receipt does not match the proposal")
             if not verify_receipt(key, r, ctx):
                 print("SIG invalid for", r["dossierId"])
-                return err(400, "RECEIPT_SIGNATURE_INVALID", "Receipt signature is invalid")
+                return commit_reject(400, "RECEIPT_SIGNATURE_INVALID", "Receipt signature is invalid")
             outcomes.append({"dossierId": p["dossierId"], "callId": p["callId"], "action": p["action"],
                              "proposalDigest": r["proposalDigest"], "receiptId": r["receiptId"],
                              "status": "executed" if r["accepted"] is True else "rejected"})
@@ -442,17 +464,17 @@ def health():
 async def endpoint(path: str, request: Request):
     raw = await request.body()
     if len(raw) > MAX_BODY:
-        return err(413, "TOO_LARGE", "Body too large")
+        return commit_reject(413, "TOO_LARGE", "Body too large")
     try:
         b = json.loads(raw)
     except Exception:
-        return err(400, "INVALID_REQUEST", "Body must be JSON")
+        return commit_reject(400, "INVALID_REQUEST", "Body must be JSON")
     if not isinstance(b, dict):
-        return err(400, "INVALID_REQUEST", "Body must be an object")
+        return commit_reject(400, "INVALID_REQUEST", "Body must be an object")
     op = b.get("operation")
     from starlette.concurrency import run_in_threadpool
     if op == "propose":
         return await run_in_threadpool(do_propose, b)
     if op == "commit":
         return await run_in_threadpool(do_commit, b)
-    return err(400, "INVALID_OPERATION", "operation must be propose or commit")
+    return commit_reject(400, "INVALID_OPERATION", "operation must be propose or commit")
